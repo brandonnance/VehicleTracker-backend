@@ -1,7 +1,7 @@
 import json
 import os
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 import psycopg2
@@ -29,6 +29,54 @@ def get_conn():
         yield conn
     finally:
         conn.close()
+
+def _ensure_datetime_utc(ts) -> datetime:
+    """
+    Convert various timestamp formats into a timezone-aware datetime in UTC.
+
+    Handles:
+      - datetime (returns as-is, ensuring tzinfo=UTC if missing)
+      - int/float: Unix seconds or milliseconds since epoch
+      - str: ISO8601 like '2025-11-13T19:26:28Z' or with offset
+    """
+    # Already a datetime
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc)
+
+    # Numeric: treat as unix seconds or ms
+    if isinstance(ts, (int, float)):
+        value = float(ts)
+        # Heuristic: ms vs sec
+        if value > 1e12:
+            # milliseconds
+            value = value / 1000.0
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+
+    # String: try ISO8601
+    if isinstance(ts, str):
+        s = ts.strip()
+        try:
+            # Handle trailing Z
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            # Last resort: try interpreting as float seconds
+            try:
+                value = float(s)
+                if value > 1e12:
+                    value = value / 1000.0
+                return datetime.fromtimestamp(value, tz=timezone.utc)
+            except Exception:
+                pass
+
+    # Fallback: now()
+    return datetime.now(timezone.utc)
 
 def fetch_jobs():
     """
@@ -88,8 +136,19 @@ def get_job_id_by_code(job_code: str) -> Optional[str]:
             row = cur.fetchone()
     return row[0] if row else None
 
+def get_all_jobs():
+    sql = """
+        SELECT id, latitude, longitude
+        FROM public.jobs;
+    """
 
-def insert_vehicle_position(
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql)
+            return cur.fetchall()
+
+
+def insert_position(
     vehicle_id: str,
     job_id: Optional[str],
     lat: float,
@@ -97,17 +156,46 @@ def insert_vehicle_position(
     heading: Optional[float],
     speed_kph: Optional[float],
     odometer_km: Optional[float],
-    timestamp_utc: datetime,
+    timestamp_utc,
     source_raw: Optional[Dict[str, Any]] = None,
 ) -> None:
+    """
+    Insert or update the *latest* vehicle/equipment position.
+
+    We now keep exactly one row per vehicle_id.
+
+    Requires:
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_vehicle_positions_vehicle_id
+        ON public.vehicle_positions (vehicle_id);
+    """
+
     sql = """
     insert into public.vehicle_positions (
-      vehicle_id, job_id, latitude, longitude, heading,
-      speed_kph, odometer_km, timestamp_utc, source_raw
+      vehicle_id,
+      job_id,
+      latitude,
+      longitude,
+      heading,
+      speed_kph,
+      odometer_km,
+      timestamp_utc,
+      source_raw
     )
-    values (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+    values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    on conflict (vehicle_id) do update
+    set
+      job_id      = excluded.job_id,
+      latitude    = excluded.latitude,
+      longitude   = excluded.longitude,
+      heading     = excluded.heading,
+      speed_kph   = excluded.speed_kph,
+      odometer_km = excluded.odometer_km,
+      timestamp_utc = excluded.timestamp_utc,
+      source_raw  = excluded.source_raw;
     """
+
     source_json = json.dumps(source_raw) if source_raw is not None else None
+    ts_dt = _ensure_datetime_utc(timestamp_utc)
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -121,7 +209,7 @@ def insert_vehicle_position(
                     heading,
                     speed_kph,
                     odometer_km,
-                    timestamp_utc,
+                    ts_dt,
                     source_json,
                 ),
             )

@@ -4,13 +4,13 @@ import math
 
 from dateutil import parser as dt_parser  # pip install python-dateutil
 
-from samsara_client import fetch_vehicle_gps_stats, normalize_vehicle_record
+from samsara_client import fetch_all_location_payloads
+from samsara_normalizer import normalize_location_record, dedupe_normalized_locations
 
 from supabase_db import (
     upsert_vehicle,
-    # get_job_id_by_code,
-    insert_vehicle_position,
-    fetch_jobs,
+    insert_position,
+    get_all_jobs,
 )
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -30,35 +30,26 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def find_nearest_job(
-    vehicle_lat: float,
-    vehicle_lon: float,
-    jobs: List[Dict[str, Any]],
-    max_distance_km: float = 1.0,  # tweak radius as needed
-) -> Optional[Dict[str, Any]]:
+def assign_nearest_job(lat: float, lon: float) -> Optional[str]:
     """
-    Given a vehicle lat/lon and a list of jobs (with lat/lon),
-    return the nearest job if it is within max_distance_km, else None.
+    Given a latitude/longitude, find the nearest job from the DB.
+    Returns job_id (UUID) or None.
     """
-    best_job = None
-    best_distance = None
+    jobs = get_all_jobs()  
+
+    nearest_job_id = None
+    nearest_distance = float("inf")
 
     for job in jobs:
-        jlat = job.get("latitude")
-        jlon = job.get("longitude")
-        if jlat is None or jlon is None:
-            continue
+        jlat = job["latitude"]
+        jlon = job["longitude"]
+        dist = haversine_km(lat, lon, jlat, jlon)
 
-        d = haversine_km(float(vehicle_lat), float(vehicle_lon), float(jlat), float(jlon))
+        if dist < nearest_distance:
+            nearest_distance = dist
+            nearest_job_id = job["id"]
 
-        if best_distance is None or d < best_distance:
-            best_distance = d
-            best_job = job
-
-    if best_job is not None and best_distance is not None and best_distance <= max_distance_km:
-        return best_job
-
-    return None
+    return nearest_job_id
 
 
 def parse_timestamp(ts: str) -> datetime:
@@ -88,84 +79,82 @@ def map_to_job_code(record) -> Optional[str]:
 
 
 def run_sync_once():
-    raw_items = fetch_vehicle_gps_stats()
-    print(f"Fetched {len(raw_items)} items from Samsara.")
+    payloads = fetch_all_location_payloads()
+    print(f"Fetched {len(payloads)} items from Samsara.")
 
-    # Fetch jobs once per sync and keep only those with coordinates
-    jobs = fetch_jobs()
-    jobs_with_coords = [
-        j
-        for j in jobs
-        if j.get("latitude") is not None and j.get("longitude") is not None
-    ]
-    print(f"Loaded {len(jobs_with_coords)} jobs with coordinates.")
+    vehicles_raw = payloads["vehicles"]
+    equipment_raw = payloads["equipment"]
+    assets_v1_raw = payloads["assets_v1"]
 
-    inserted_count = 0
-    normalized_count = 0
-    missing_latlon_count = 0
-    skipped_norm_count = 0
+    print(f"Fetched {len(vehicles_raw)} vehicle locations (v2).")
+    print(f"Fetched {len(equipment_raw)} equipment locations (v2).")
+    print(f"Fetched {len(assets_v1_raw)} assets (v1).")
 
-    for idx, raw in enumerate(raw_items):
-        norm = normalize_vehicle_record(raw)
-        if not norm:
-            skipped_norm_count += 1
-            if idx < 3:
-                print(f"[DEBUG] Item {idx}: normalize_vehicle_record returned None. Keys: {list(raw.keys())}")
-            continue
+    skipped_normalize = 0
+    normalized = []
 
-        normalized_count += 1
+    # Vehicles (v2)
+    for item in vehicles_raw:
+        rec = normalize_location_record(item, category="vehicles_v2")
+        if rec:
+            normalized.append(rec)
+        else:
+            skipped_normalize += 1
 
-        if norm["latitude"] is None or norm["longitude"] is None:
-            missing_latlon_count += 1
-            if idx < 3:
-                print(f"[DEBUG] Item {idx}: latitude/longitude missing in normalized record: {norm}")
-            continue
+    # Equipment (v2)
+    for item in equipment_raw:
+        rec = normalize_location_record(item, category="equipment_v2")
+        if rec:
+            normalized.append(rec)
+        else:
+            skipped_normalize += 1
+        
+    # Assets (v1)
+    for item in assets_v1_raw:
+        rec = normalize_location_record(item, category="assets_v1")
+        if rec:
+            normalized.append(rec)
+        else:
+            skipped_normalize += 1
 
-        # 1) Ensure vehicle exists in vehicles table
+    print("Normalized total:", len(normalized))
+    print("Skipped (normalize returned None):", skipped_normalize)
+
+    # 3. Dedupe before touching Supabase
+    deduped = dedupe_normalized_locations(normalized)
+    print(f"After dedupe: {len(deduped)} records "
+          f"(removed {len(normalized) - len(deduped)} duplicates)")
+
+    # 4. Write to Supabase (upsert + insert positions)
+    inserted_positions = 0
+
+    for rec in deduped:
         vehicle_id = upsert_vehicle(
-            external_id=norm["external_id"],
-            source_system=norm["source_system"],
-            name=norm["name"],
-            vtype=norm["vehicle_type"],
+            external_id=rec["external_id"],
+            source_system=rec["source_system"],
+            name=rec["name"],
+            vtype=rec.get("vehicle_type"),
+            description=None,  # or whatever you use
         )
 
-        # 2) Find nearest job by distance, if any
-        nearest_job = None
-        if jobs_with_coords:
-            nearest_job = find_nearest_job(
-                norm["latitude"],
-                norm["longitude"],
-                jobs_with_coords,
-                max_distance_km=1.0,  # tweak this radius as desired
-            )
+        # TODO: plug back in your nearest-job logic here
+        job_id = assign_nearest_job(rec["latitude"], rec["longitude"])
 
-        job_id = nearest_job["id"] if nearest_job else None
-
-        # 3) Parse timestamp
-        ts = norm["timestamp_utc"]
-        if isinstance(ts, str):
-            ts_dt = parse_timestamp(ts)
-        else:
-            ts_dt = ts
-
-        # 4) Insert position
-        insert_vehicle_position(
+        insert_position(
             vehicle_id=vehicle_id,
             job_id=job_id,
-            lat=float(norm["latitude"]),
-            lon=float(norm["longitude"]),
-            heading=float(norm["heading"]) if norm["heading"] is not None else None,
-            speed_kph=float(norm["speed_kph"]) if norm["speed_kph"] is not None else None,
-            odometer_km=float(norm["odometer_km"]) if norm["odometer_km"] is not None else None,
-            timestamp_utc=ts_dt,
-            source_raw=norm["raw"],
+            lat=rec["latitude"],
+            lon=rec["longitude"],
+            heading=None,              # we don't have heading yet from locations
+            speed_kph=rec["speed_kph"],
+            odometer_km=None,          # not in the new location endpoints
+            timestamp_utc=rec["timestamp_utc"],
+            source_raw=rec["raw"],
         )
-        inserted_count += 1
 
-    print(f"Normalized: {normalized_count}")
-    print(f"Skipped (normalize returned None): {skipped_norm_count}")
-    print(f"Skipped (missing lat/lon): {missing_latlon_count}")
-    print(f"Inserted {inserted_count} positions into Supabase.")
+        inserted_positions += 1
+
+    print(f"Inserted {inserted_positions} positions into Supabase.")
 
 
 if __name__ == "__main__":
