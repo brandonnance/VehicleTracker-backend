@@ -22,11 +22,13 @@ def dedupe_normalized_locations(
 ) -> List[Dict[str, Any]]:
     """
     Given a list of normalized location records (output of normalize_location_record),
-    deduplicate them by a stable key.
+    deduplicate them by name across all source systems.
 
-    Priority:
-      - Key: external_id, if present
-      - Fallback: name + lat + lon
+    New behavior:
+      - Primary key: normalized name (case-insensitive, trimmed)
+      - Fallback if name is missing/empty:
+          - Use external_id if present
+          - Else fall back to name+lat+lon (very rare / weird cases)
 
     If multiple records share the same key, we keep the one with the
     highest-priority source_category (vehicles_v2 > equipment_v2 > assets_v1).
@@ -34,20 +36,23 @@ def dedupe_normalized_locations(
     by_key: Dict[str, Dict[str, Any]] = {}
 
     for rec in records:
+        name_raw = (rec.get("name") or "").strip()
         ext_id = rec.get("external_id")
         lat = rec.get("latitude")
         lon = rec.get("longitude")
-        name = rec.get("name") or ""
 
-        if ext_id:
-            key = f"id:{ext_id}"
+        if name_raw:
+            # ✅ Primary key: name only, normalized
+            key = f"name:{name_raw.lower()}"
+        elif ext_id:
+            # Fallback: if somehow we have no name but do have an ID
+            key = f"id-fallback:{ext_id}"
         else:
-            # Fallback if ext_id is missing for some weird case
+            # Last-resort fallback: name + lat + lon (for very weird cases)
             if lat is None or lon is None:
-                # No good key, just skip dedupe on this one
-                key = f"name-only:{name}"
+                key = f"unnamed:{id(rec)}"  # effectively no dedupe, unique per record
             else:
-                key = f"name_lat_lon:{name}|{round(float(lat), 5)}|{round(float(lon), 5)}"
+                key = f"latlon:{round(float(lat), 5)}|{round(float(lon), 5)}"
 
         existing = by_key.get(key)
         if not existing:
@@ -56,10 +61,13 @@ def dedupe_normalized_locations(
             # Decide which one to keep based on category priority
             old_rank = _category_rank(existing.get("source_category", ""))
             new_rank = _category_rank(rec.get("source_category", ""))
+
+            # Lower rank value = higher priority (per your existing logic)
             if new_rank < old_rank:
                 by_key[key] = rec
 
     return list(by_key.values())
+
 
 
 def _extract_location_common(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:

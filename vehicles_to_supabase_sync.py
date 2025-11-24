@@ -2,10 +2,11 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 import math
 
-from dateutil import parser as dt_parser  # pip install python-dateutil
+from dateutil import parser as dt_parser  
 
 from samsara_client import fetch_all_location_payloads
 from samsara_normalizer import normalize_location_record, dedupe_normalized_locations
+from cat_client import fetch_cat_positions
 
 from supabase_db import (
     upsert_vehicle,
@@ -117,7 +118,12 @@ def run_sync_once():
         else:
             skipped_normalize += 1
 
-    print("Normalized total:", len(normalized))
+    cat_records = fetch_cat_positions()
+    normalized.extend(cat_records)
+
+    print("Samsara Normalized total:", len(normalized))
+    print("CAT records: ", len(cat_records))
+    print(f"Total records before dedupe: {len(normalized)}")
     print("Skipped (normalize returned None):", skipped_normalize)
 
     # 3. Dedupe before touching Supabase

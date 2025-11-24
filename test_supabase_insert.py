@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from supabase_db import (
     upsert_vehicle,
     get_job_id_by_code,
-    insert_vehicle_position,
+    insert_position,
     get_latest_positions,
 )
 
@@ -36,7 +36,7 @@ def main():
     print("Job ID:", job_id)
 
     # 4) Insert a new position
-    insert_vehicle_position(
+    insert_position(
         vehicle_id=vehicle_id,
         job_id=job_id,
         lat=lat,
