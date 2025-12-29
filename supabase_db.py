@@ -1,34 +1,35 @@
-import json
 import os
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# Load .env file if present (for local development)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, rely on system env vars
 
-DB_HOST = os.getenv("DB_HOST", "aws-1-us-east-2.pooler.supabase.com")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_USER = os.getenv("DB_USER", "postgres.ksudmixptotaiynpvcvt")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "password4GAME9988")
-DB_NAME = os.getenv("DB_NAME", "postgres")
-DB_SSLMODE = os.getenv("DB_SSLMODE", "require")
+from supabase import create_client, Client
+
+# ForeSyt Supabase connection via REST API
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+# Lazy-initialized client
+_supabase_client: Optional[Client] = None
 
 
-@contextmanager
-def get_conn():
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        port=DB_PORT,
-        sslmode=DB_SSLMODE,  # Supabase requires SSL
-    )
-    try:
-        yield conn
-    finally:
-        conn.close()
+def get_client() -> Client:
+    """Get or create the Supabase client."""
+    global _supabase_client
+    if _supabase_client is None:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            raise ValueError(
+                "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment"
+            )
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    return _supabase_client
+
 
 def _ensure_datetime_utc(ts) -> datetime:
     """
@@ -78,25 +79,9 @@ def _ensure_datetime_utc(ts) -> datetime:
     # Fallback: now()
     return datetime.now(timezone.utc)
 
-def fetch_jobs():
-    """
-    Fetch all jobs (with coords) from the jobs table.
-    Returns a list of dicts with id, job_code, name, lat, long
-    """
 
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                select id, job_code, name, latitude, longitude
-                from public.jobs
-                """
-            )
-            rows = cur.fetchall()
-        return rows
-
-   
 def upsert_vehicle(
+    organization_id: str,
     external_id: str,
     source_system: str,
     name: Optional[str] = None,
@@ -105,52 +90,48 @@ def upsert_vehicle(
 ) -> str:
     """
     Ensure the vehicle exists and return its uuid.
+    Uses (organization_id, external_id, source_system) as the unique key.
     """
-    sql = """
-    insert into public.vehicles (external_id, source_system, name, type, description)
-    values (%s, %s, %s, %s, %s)
-    on conflict (external_id, source_system)
-    do update set
-      name = coalesce(excluded.name, public.vehicles.name),
-      type = coalesce(excluded.type, public.vehicles.type),
-      description = coalesce(excluded.description, public.vehicles.description)
-    returning id;
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (external_id, source_system, name, vtype, description))
-            row = cur.fetchone()
-            if row:
-                vehicle_id = row[0]
-            else:
-                vehicle_id = None
-        conn.commit()
-    return str(vehicle_id)
+    client = get_client()
 
+    data = {
+        "organization_id": organization_id,
+        "external_id": external_id,
+        "source_system": source_system,
+        "name": name,
+        "type": vtype,
+        "description": description,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
-def get_job_id_by_code(job_code: str) -> Optional[str]:
-    sql = "select id from public.jobs where job_code = %s"
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (job_code,))
-            row = cur.fetchone()
-    return row[0] if row else None
+    # Remove None values (let DB use defaults)
+    data = {k: v for k, v in data.items() if v is not None}
 
-def get_all_jobs():
-    sql = """
-        SELECT id, latitude, longitude
-        FROM public.jobs;
-    """
+    result = (
+        client.table("vehicles")
+        .upsert(data, on_conflict="organization_id,external_id,source_system")
+        .execute()
+    )
 
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql)
-            return cur.fetchall()
+    if result.data and len(result.data) > 0:
+        return str(result.data[0]["id"])
+
+    # If upsert didn't return data, query for the vehicle
+    query_result = (
+        client.table("vehicles")
+        .select("id")
+        .eq("organization_id", organization_id)
+        .eq("external_id", external_id)
+        .eq("source_system", source_system)
+        .single()
+        .execute()
+    )
+    return str(query_result.data["id"])
 
 
 def insert_position(
+    organization_id: str,
     vehicle_id: str,
-    job_id: Optional[str],
     lat: float,
     lon: float,
     heading: Optional[float],
@@ -162,88 +143,61 @@ def insert_position(
     """
     Insert or update the *latest* vehicle/equipment position.
 
-    We now keep exactly one row per vehicle_id.
-
-    Requires:
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_vehicle_positions_vehicle_id
-        ON public.vehicle_positions (vehicle_id);
+    We keep exactly one row per vehicle_id (unique constraint).
+    job_id is NOT set here - the refresh_vehicle_positions() function
+    or the latest_vehicle_positions view handles job assignment.
     """
-
-    sql = """
-    insert into public.vehicle_positions (
-      vehicle_id,
-      job_id,
-      latitude,
-      longitude,
-      heading,
-      speed_kph,
-      odometer_km,
-      timestamp_utc,
-      source_raw
-    )
-    values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    on conflict (vehicle_id) do update
-    set
-      job_id      = excluded.job_id,
-      latitude    = excluded.latitude,
-      longitude   = excluded.longitude,
-      heading     = excluded.heading,
-      speed_kph   = excluded.speed_kph,
-      odometer_km = excluded.odometer_km,
-      timestamp_utc = excluded.timestamp_utc,
-      source_raw  = excluded.source_raw;
-    """
-
-    source_json = json.dumps(source_raw) if source_raw is not None else None
+    client = get_client()
     ts_dt = _ensure_datetime_utc(timestamp_utc)
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                sql,
-                (
-                    vehicle_id,
-                    job_id,
-                    lat,
-                    lon,
-                    heading,
-                    speed_kph,
-                    odometer_km,
-                    ts_dt,
-                    source_json,
-                ),
-            )
-        conn.commit()
+    data = {
+        "organization_id": organization_id,
+        "vehicle_id": vehicle_id,
+        "latitude": lat,
+        "longitude": lon,
+        "heading": heading,
+        "speed_kph": speed_kph,
+        "odometer_km": odometer_km,
+        "timestamp_utc": ts_dt.isoformat(),
+        "source_raw": source_raw,
+    }
+
+    # Upsert based on vehicle_id unique constraint
+    client.table("vehicle_positions").upsert(
+        data, on_conflict="vehicle_id"
+    ).execute()
 
 
-def get_latest_positions() -> list[dict]:
+def get_latest_positions(organization_id: Optional[str] = None) -> list[dict]:
     """
     Read from the latest_vehicle_positions view.
+    Optionally filter by organization_id.
     """
-    sql = """
-    select
-      vehicle_id,
-      vehicle_name,
-      vehicle_type,
-      job_id,
-      job_code,
-      job_name,
-      latitude,
-      longitude,
-      speed_kph,
-      timestamp_utc
-    from public.latest_vehicle_positions
-    order by vehicle_name;
-    """
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
-    return list(rows) 
+    client = get_client()
+
+    query = client.table("latest_vehicle_positions").select(
+        "vehicle_id, vehicle_name, vehicle_type, external_id, source_system, "
+        "job_id, job_code, job_name, job_latitude, job_longitude, "
+        "latitude, longitude, speed_kph, heading, odometer_km, "
+        "timestamp_utc, organization_id, distance_to_job_meters"
+    )
+
+    if organization_id:
+        query = query.eq("organization_id", organization_id)
+
+    query = query.order("vehicle_name")
+    result = query.execute()
+
+    return result.data if result.data else []
+
 
 if __name__ == "__main__":
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("select version();")
-            row = cur.fetchone()
-            print("Connected! Server version:", row[0] if row else None)
+    # Test connection
+    try:
+        client = get_client()
+        # Try a simple query
+        result = client.table("vehicles").select("id").limit(1).execute()
+        print(f"Connected! Supabase URL: {SUPABASE_URL}")
+        print(f"Vehicles table accessible: {result.data is not None}")
+    except Exception as e:
+        print(f"Connection failed: {e}")

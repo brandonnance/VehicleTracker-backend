@@ -1,3 +1,5 @@
 psycopg2-binary
 requests
 python-dateutil
+python-dotenv
+supabase
