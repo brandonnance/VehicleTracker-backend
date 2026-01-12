@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
 # Load .env file if present (for local development)
@@ -87,13 +87,33 @@ def upsert_vehicle(
     name: Optional[str] = None,
     vtype: Optional[str] = None,
     description: Optional[str] = None,
-) -> str:
+) -> Optional[str]:
     """
     Ensure the vehicle exists and return its uuid.
     Uses (organization_id, external_id, source_system) as the unique key.
+
+    Returns None if the vehicle is soft-deleted (blocklisted), indicating
+    it should be skipped during sync.
     """
     client = get_client()
 
+    # Check if vehicle already exists and is soft-deleted
+    existing = (
+        client.table("vehicles")
+        .select("id, is_deleted")
+        .eq("organization_id", organization_id)
+        .eq("external_id", external_id)
+        .eq("source_system", source_system)
+        .execute()
+    )
+
+    if existing.data and len(existing.data) > 0:
+        vehicle = existing.data[0]
+        if vehicle.get("is_deleted"):
+            # Vehicle is soft-deleted, skip syncing it
+            return None
+
+    now = datetime.now(timezone.utc).isoformat()
     data = {
         "organization_id": organization_id,
         "external_id": external_id,
@@ -101,7 +121,8 @@ def upsert_vehicle(
         "name": name,
         "type": vtype,
         "description": description,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": now,
+        "last_seen_at": now,  # Track when vehicle was last seen in sync
     }
 
     # Remove None values (let DB use defaults)
@@ -189,6 +210,216 @@ def get_latest_positions(organization_id: Optional[str] = None) -> list[dict]:
     result = query.execute()
 
     return result.data if result.data else []
+
+
+def delete_stale_vehicles(organization_id: str, stale_days: int = 7) -> int:
+    """
+    Delete vehicles not seen in any sync for the specified number of days.
+
+    Args:
+        organization_id: The organization to clean up
+        stale_days: Number of days after which a vehicle is considered stale (default: 7)
+
+    Returns:
+        Number of vehicles deleted
+
+    Note:
+        vehicle_positions are automatically deleted via CASCADE constraint.
+    """
+    client = get_client()
+
+    # Calculate cutoff timestamp
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=stale_days)).isoformat()
+
+    # First, get the vehicles to be deleted (for count and logging)
+    stale_result = (
+        client.table("vehicles")
+        .select("id, name, external_id, source_system")
+        .eq("organization_id", organization_id)
+        .lt("last_seen_at", cutoff)
+        .execute()
+    )
+
+    stale_vehicles = stale_result.data or []
+    delete_count = len(stale_vehicles)
+
+    if delete_count > 0:
+        # Log which vehicles are being deleted
+        for v in stale_vehicles:
+            print(f"  Removing stale vehicle: {v['name']} ({v['source_system']}/{v['external_id']})")
+
+        # Delete stale vehicles (positions auto-deleted via CASCADE)
+        client.table("vehicles") \
+            .delete() \
+            .eq("organization_id", organization_id) \
+            .lt("last_seen_at", cutoff) \
+            .execute()
+
+    return delete_count
+
+
+def delete_vehicle(
+    organization_id: str,
+    vehicle_id: Optional[str] = None,
+    external_id: Optional[str] = None,
+    name: Optional[str] = None,
+    source_system: Optional[str] = None,
+) -> bool:
+    """
+    Delete a specific vehicle by ID, external_id, or name.
+
+    Args:
+        organization_id: The organization the vehicle belongs to
+        vehicle_id: UUID of the vehicle (highest priority)
+        external_id: External ID from source system (requires source_system)
+        name: Vehicle name (least specific, may match multiple)
+        source_system: Source system filter (required with external_id, optional with name)
+
+    Returns:
+        True if vehicle(s) were deleted, False if no matching vehicle found
+
+    Raises:
+        ValueError: If no identifier provided or invalid combination
+
+    Note:
+        vehicle_positions are automatically deleted via CASCADE constraint.
+    """
+    if not any([vehicle_id, external_id, name]):
+        raise ValueError("Must provide at least one of: vehicle_id, external_id, or name")
+
+    if external_id and not source_system:
+        raise ValueError("source_system is required when using external_id")
+
+    client = get_client()
+
+    # Build query
+    query = client.table("vehicles").delete().eq("organization_id", organization_id)
+
+    if vehicle_id:
+        # Most specific: delete by UUID
+        query = query.eq("id", vehicle_id)
+    elif external_id:
+        # Delete by external_id + source_system
+        query = query.eq("external_id", external_id).eq("source_system", source_system)
+    else:
+        # Delete by name (optionally filtered by source_system)
+        query = query.eq("name", name)
+        if source_system:
+            query = query.eq("source_system", source_system)
+
+    result = query.execute()
+
+    # Check if any rows were deleted
+    return result.data is not None and len(result.data) > 0
+
+
+def soft_delete_vehicle(
+    organization_id: str,
+    vehicle_id: Optional[str] = None,
+    external_id: Optional[str] = None,
+    name: Optional[str] = None,
+    source_system: Optional[str] = None,
+) -> int:
+    """
+    Soft delete (blocklist) a vehicle by setting is_deleted=true.
+
+    This prevents the vehicle from:
+    - Appearing in the frontend (view excludes deleted vehicles)
+    - Being re-created during sync (upsert checks is_deleted flag)
+
+    Args:
+        organization_id: The organization the vehicle belongs to
+        vehicle_id: UUID of the vehicle (highest priority)
+        external_id: External ID from source system (requires source_system)
+        name: Vehicle name (least specific, may match multiple)
+        source_system: Source system filter (required with external_id, optional with name)
+
+    Returns:
+        Number of vehicles soft-deleted
+
+    Raises:
+        ValueError: If no identifier provided or invalid combination
+    """
+    if not any([vehicle_id, external_id, name]):
+        raise ValueError("Must provide at least one of: vehicle_id, external_id, or name")
+
+    if external_id and not source_system:
+        raise ValueError("source_system is required when using external_id")
+
+    client = get_client()
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Build query
+    query = (
+        client.table("vehicles")
+        .update({"is_deleted": True, "deleted_at": now})
+        .eq("organization_id", organization_id)
+        .eq("is_deleted", False)  # Only update non-deleted vehicles
+    )
+
+    if vehicle_id:
+        query = query.eq("id", vehicle_id)
+    elif external_id:
+        query = query.eq("external_id", external_id).eq("source_system", source_system)
+    else:
+        query = query.eq("name", name)
+        if source_system:
+            query = query.eq("source_system", source_system)
+
+    result = query.execute()
+
+    return len(result.data) if result.data else 0
+
+
+def restore_vehicle(
+    organization_id: str,
+    vehicle_id: Optional[str] = None,
+    external_id: Optional[str] = None,
+    name: Optional[str] = None,
+    source_system: Optional[str] = None,
+) -> int:
+    """
+    Restore a soft-deleted vehicle by setting is_deleted=false.
+
+    Args:
+        organization_id: The organization the vehicle belongs to
+        vehicle_id: UUID of the vehicle (highest priority)
+        external_id: External ID from source system (requires source_system)
+        name: Vehicle name
+        source_system: Source system filter
+
+    Returns:
+        Number of vehicles restored
+    """
+    if not any([vehicle_id, external_id, name]):
+        raise ValueError("Must provide at least one of: vehicle_id, external_id, or name")
+
+    if external_id and not source_system:
+        raise ValueError("source_system is required when using external_id")
+
+    client = get_client()
+
+    # Build query
+    query = (
+        client.table("vehicles")
+        .update({"is_deleted": False, "deleted_at": None})
+        .eq("organization_id", organization_id)
+        .eq("is_deleted", True)  # Only update deleted vehicles
+    )
+
+    if vehicle_id:
+        query = query.eq("id", vehicle_id)
+    elif external_id:
+        query = query.eq("external_id", external_id).eq("source_system", source_system)
+    else:
+        query = query.eq("name", name)
+        if source_system:
+            query = query.eq("source_system", source_system)
+
+    result = query.execute()
+
+    return len(result.data) if result.data else 0
 
 
 if __name__ == "__main__":
